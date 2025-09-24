@@ -1,0 +1,31 @@
+name: Monitor GS Jobs
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Adjust to '*/5 * * * *' for 5‑minute intervals
+  workflow_dispatch:
+
+jobs:
+  check-for-postings:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install Chrome and Chromedriver
+        uses: browser-actions/setup-chrome@v1
+
+      - uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: pip install selenium webdriver-manager beautifulsoup4
+
+      - name: Run monitor script
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python monitor_jobs.py
+        
