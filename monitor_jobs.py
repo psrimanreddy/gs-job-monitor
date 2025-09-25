@@ -70,6 +70,7 @@ place. Use at your own discretion.
 import os
 import time
 import smtplib
+import argparse
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -84,12 +85,13 @@ from webdriver_manager.chrome import ChromeDriverManager
 # Configuration
 # ---------------------------------------------------------------------------
 
-# URL to monitor. Replace with your customized search URL. The default
-# provided here corresponds to the user's supplied query for Analyst and
-# Associate roles across several U.S. locations sorted by posted date.
+# URL to monitor. Replace with your customized search URL.
+# The default provided here filters for Analyst and Associate roles in
+# Software Engineering across specific U.S. locations, sorted by posted date.
 TARGET_URL = (
     "https://higher.gs.com/results?EXPERIENCE_LEVEL=Analyst|Associate"
-    "&LOCATION=San%20Francisco|Wilmington|Miami|West%20Palm%20Beach|Atlanta|Chicago"
+    "&JOB_FUNCTION=Software%20Engineering"
+    "&LOCATION=San%20Francisco|Wilmington|West%20Palm%20Beach|Atlanta|Chicago"
     "|Boston|Jersey%20City|Albany|New%20York|Dallas|Houston|Richardson|Draper|Salt%20Lake%20City"
     "&page=1&sort=POSTED_DATE"
 )
@@ -102,6 +104,12 @@ NOTIFICATION_RECIPIENTS = [
 
 # Interval between checks (in seconds). 1800 seconds = 30 minutes.
 CHECK_INTERVAL = 1800
+
+# Optional keyword filters for job titles. Only titles containing at least
+# one of the keywords will be considered. Modify this list to narrow
+# notifications to specific roles. By default, we focus on Software
+# Engineering roles.
+TITLE_KEYWORDS = ["Software", "Engineer", "Engineering"]
 
 # File to persist IDs of jobs that have already triggered notifications.
 SEEN_FILE = "seen_jobs.txt"
@@ -178,8 +186,15 @@ def get_current_postings() -> list[tuple[str, str]]:
         href = a["href"]
         if href.startswith("/roles/"):
             title = a.get_text(strip=True)
-            if title:  # Ensure non-empty titles
-                postings.append((href, title))
+            if not title:
+                continue
+            # Apply keyword filtering if TITLE_KEYWORDS is defined. If any
+            # keyword appears in the title (case-insensitive), include it.
+            if TITLE_KEYWORDS:
+                lower_title = title.lower()
+                if not any(keyword.lower() in lower_title for keyword in TITLE_KEYWORDS):
+                    continue
+            postings.append((href, title))
     return postings
 
 
@@ -225,8 +240,81 @@ def send_email(new_jobs: list[tuple[str, str]]) -> None:
         print(f"Failed to send email: {exc}")
 
 
+def run_once() -> None:
+    """
+    Perform a single check for new job postings and send notifications.
+
+    This helper is used when running the script in a scheduled
+    environment like GitHub Actions. It loads the existing set of
+    previously seen jobs, fetches the current postings, sends an email
+    for any newly discovered jobs, updates the persistence file, and
+    then exits.
+    """
+    seen_jobs = load_seen_jobs()
+    try:
+        postings = get_current_postings()
+        new_jobs = [(job_id, title) for job_id, title in postings if job_id not in seen_jobs]
+
+        if new_jobs:
+            send_email(new_jobs)
+            save_new_jobs([job_id for job_id, _ in new_jobs])
+    except Exception as exc:
+        print(f"Error during monitoring: {exc}")
+
+
+def initialize_seen_jobs() -> None:
+    """
+    Populate ``seen_jobs.txt`` with all current postings without sending any emails.
+
+    This helper is useful when you want to start monitoring without being alerted
+    about all existing jobs. It fetches the current postings, writes their
+    identifiers to the persistence file, and exits.
+    """
+    try:
+        postings = get_current_postings()
+        job_ids = [job_id for job_id, _ in postings]
+        # Overwrite the file to ensure a clean start
+        with open(SEEN_FILE, "w", encoding="utf-8") as f:
+            for jid in job_ids:
+                f.write(jid + "\n")
+        print(f"Initialized seen jobs file with {len(job_ids)} postings.")
+    except Exception as exc:
+        print(f"Error during initialization: {exc}")
+
+
 def main() -> None:
-    """Main loop that monitors the site and notifies on changes."""
+    """
+    Entry point for the script.
+
+    If invoked with the ``--run-once`` command-line option, the script
+    will perform a single check for new postings and then exit. This
+    mode is intended for scheduled environments (e.g., GitHub Actions).
+
+    Otherwise, the script runs continuously, checking the target URL at
+    the interval specified by ``CHECK_INTERVAL``.
+    """
+    parser = argparse.ArgumentParser(description="Monitor Goldman Sachs job postings.")
+    parser.add_argument(
+        "--run-once",
+        action="store_true",
+        help="Perform a single run of the monitor instead of looping."
+    )
+    parser.add_argument(
+        "--initialize",
+        action="store_true",
+        help="Populate the seen jobs file with current postings without sending email and exit."
+    )
+    args = parser.parse_args()
+
+    if args.initialize:
+        initialize_seen_jobs()
+        return
+
+    if args.run_once:
+        run_once()
+        return
+
+    # Continuous monitoring loop
     seen_jobs = load_seen_jobs()
     print(f"Loaded {len(seen_jobs)} previously seen jobs.")
 
@@ -243,7 +331,6 @@ def main() -> None:
             # Catch all exceptions to prevent the loop from stopping.
             print(f"Error during monitoring: {exc}")
 
-        # Sleep until the next check
         # Print next scheduled run for logging purposes
         next_time = datetime.now() + timedelta(seconds=CHECK_INTERVAL)
         print(
