@@ -2,7 +2,7 @@ name: Monitor GS Jobs
 
 on:
   schedule:
-    # Run every 15 minutes; adjust as needed
+    # Run every 15 minutes in UTC; skip weekends in script
     - cron: '*/15 * * * *'
 
 concurrency:
@@ -13,6 +13,15 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
+      # Skip weekends in Eastern Time
+      - name: Skip if weekend in ET
+        run: |
+          dow=$(TZ="America/New_York" date +%u)   # 1=Mon ... 7=Sun
+          if [ "$dow" -ge 6 ]; then
+            echo "Weekend in Eastern Time (ET); exiting."
+            exit 0
+          fi
+
       # Check out the repository to access the script and persistence file
       - uses: actions/checkout@v2
 
@@ -37,7 +46,7 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         run: python monitor_jobs.py --run-once
 
-      # Commit and push updated seen_jobs.txt so that future runs know which jobs have been processed
+      # Commit and push updated seen_jobs.txt
       - name: Commit updated seen jobs
         run: |
           if [ -f seen_jobs.txt ]; then
