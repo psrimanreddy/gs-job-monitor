@@ -19,3 +19,5 @@
 /roles/152336
 /roles/145655
 /roles/151954
+/roles/152334
+/roles/151795
