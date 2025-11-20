@@ -5,6 +5,9 @@ on:
     # Run every 15 minutes in UTC; skip weekends in script
     - cron: '*/15 * * * *'
 
+permissions:
+  contents: write
+
 concurrency:
   group: gs-job-monitor
   cancel-in-progress: true
@@ -23,9 +26,10 @@ jobs:
           fi
 
       # Check out the repository to access the script and persistence file
-      - uses: actions/checkout@v2
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      # Install Google Chrome and Chromedriver
+      # Install Google Chrome and Chromedriver (via Selenium Manager)
       - name: Set up Chrome
         uses: browser-actions/setup-chrome@v1
 
