@@ -52,6 +52,22 @@ MS_URL = (
     "&filter_profession=software+engineering"
 )
 
+GOOGLE_URL = (
+    "https://www.google.com/about/careers/applications/jobs/results?"
+    "target_level=MID&target_level=EARLY"
+    "&employment_type=FULL_TIME"
+    "&sort_by=date"
+    "&location=United%20States"
+    "&q=%22Software%20Engineer%22"
+)
+
+META_URL = (
+    "https://www.metacareers.com/jobsearch?"
+    "q=Software%20Engineer"
+    "&sort_by_new=true"
+    "&offices[0]=North%20America"
+)
+
 EXCLUDED_KEYWORDS = [
     "staff",
     "manager",
@@ -91,8 +107,8 @@ def is_excluded(title: str) -> bool:
 
 def is_ms_relevant_title(title: str) -> bool:
     """
-    For Microsoft results, only keep Software Engineer or Software Engineer II
-    and ignore senior, principal, manager, lead, architect, intern roles.
+    Microsoft: only keep Software Engineer or Software Engineer II variants.
+    Drop senior/principal/manager/architect/lead/intern roles.
     """
     t = title.lower()
 
@@ -115,6 +131,62 @@ def is_ms_relevant_title(title: str) -> bool:
         "software engineer",
     ]
     return any(t.startswith(prefix) for prefix in allowed_prefixes)
+
+
+def is_google_relevant_title(title: str) -> bool:
+    """
+    Google: keep Software Engineer, Software Engineer II, Software Engineer III.
+    Exclude senior and above.
+    """
+    t = title.lower()
+
+    exclude_tokens = [
+        "senior",
+        "principal",
+        "director",
+        "architect",
+        "manager",
+        "lead",
+        "intern",
+        "internship",
+    ]
+    if any(token in t for token in exclude_tokens):
+        return False
+
+    allowed_prefixes = [
+        "software engineer iii",
+        "software engineer ii",
+        "software engineer 3",
+        "software engineer 2",
+        "software engineer",
+    ]
+    return any(t.startswith(prefix) for prefix in allowed_prefixes)
+
+
+def is_meta_relevant_title(title: str) -> bool:
+    """
+    Meta: only Software Engineer roles, excluding senior/staff/manager/lead/etc.
+    """
+    t = title.lower()
+
+    if "software engineer" not in t:
+        return False
+
+    exclude_tokens = [
+        "senior",
+        "staff",
+        "principal",
+        "director",
+        "architect",
+        "manager",
+        "lead",
+        "intern",
+        "internship",
+    ]
+    if any(token in t for token in exclude_tokens):
+        return False
+
+    return True
 
 
 def start_browser() -> webdriver.Chrome:
@@ -266,6 +338,147 @@ def scrape_ms(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
     return results
 
 
+def scrape_google(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
+    """
+    Google careers search results:
+    - Use headings that contain Software Engineer in the title.
+    - Attach the nearest Learn more (or Copy link) URL as the job link.
+    """
+    source = "Google"
+    base = "https://www.google.com"
+
+    driver.get(GOOGLE_URL)
+    try:
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "h2, h3, h4")
+            )
+        )
+    except Exception:
+        pass
+
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    results: list[tuple[str, str, str]] = []
+    seen_urls = set()
+
+    headings = soup.find_all(["h2", "h3", "h4"])
+    for h in headings:
+        title = h.get_text(strip=True)
+        if not title:
+            continue
+        if "software engineer" not in title.lower():
+            continue
+        if is_excluded(title):
+            continue
+        if not is_google_relevant_title(title):
+            continue
+
+        # Walk up or across to find the Learn more link in the same job card
+        container = None
+
+        # Try ancestors first
+        current = h
+        for _ in range(6):
+            if current is None:
+                break
+            if current.find(
+                "a",
+                string=lambda s: s and "learn more" in s.strip().lower(),
+            ):
+                container = current
+                break
+            current = current.parent
+
+        # Fallback: nearby siblings
+        if container is None:
+            sibling = h
+            for _ in range(8):
+                sibling = sibling.next_sibling
+                if sibling is None:
+                    break
+                if getattr(sibling, "find", None):
+                    if sibling.find(
+                        "a",
+                        string=lambda s: s and "learn more" in s.strip().lower(),
+                    ):
+                        container = sibling
+                        break
+
+        if container is None:
+            continue
+
+        link = container.find(
+            "a",
+            string=lambda s: s and "learn more" in s.strip().lower(),
+        )
+        if not link:
+            link = container.find(
+                "a",
+                string=lambda s: s and "copy link" in s.strip().lower(),
+            )
+        if not link:
+            continue
+
+        href = (link.get("href") or "").strip()
+        if not href:
+            continue
+
+        url = absolute(base, href)
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+        results.append((source, url, title))
+
+    return results
+
+
+def scrape_meta(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
+    """
+    Meta careers search:
+    - Look for anchors whose href contains /jobs/.
+    - Keep only Software Engineer titles (non senior/staff/manager).
+    """
+    source = "Meta"
+    base = "https://www.metacareers.com"
+
+    driver.get(META_URL)
+    try:
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, 'a[href*="/jobs/"]')
+            )
+        )
+    except Exception:
+        pass
+
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    results: list[tuple[str, str, str]] = []
+    seen_urls = set()
+
+    anchors = soup.select('a[href*="/jobs/"]')
+    for a in anchors:
+        href = (a.get("href") or "").strip()
+        title = a.get_text(strip=True)
+
+        if not href or not title:
+            continue
+
+        if is_excluded(title):
+            continue
+        if not is_meta_relevant_title(title):
+            continue
+
+        url = absolute(base, href)
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+        results.append((source, url, title))
+
+    return results
+
+
 # ===============================
 # Email
 # ===============================
@@ -327,6 +540,7 @@ def send_email(new_items: list[tuple[str, str, str]]) -> None:
 
 def fetch_all(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
     items: list[tuple[str, str, str]] = []
+
     try:
         items.extend(scrape_gs(driver))
     except Exception as exc:
@@ -341,6 +555,16 @@ def fetch_all(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
         items.extend(scrape_ms(driver))
     except Exception as exc:
         print(f"[WARN] Microsoft scrape error: {exc}")
+
+    try:
+        items.extend(scrape_google(driver))
+    except Exception as exc:
+        print(f"[WARN] Google scrape error: {exc}")
+
+    try:
+        items.extend(scrape_meta(driver))
+    except Exception as exc:
+        print(f"[WARN] Meta scrape error: {exc}")
 
     return items
 
