@@ -340,9 +340,11 @@ def scrape_ms(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
 
 def scrape_google(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
     """
-    Google careers search results:
-    - Use headings that contain Software Engineer in the title.
-    - Attach the nearest Learn more (or Copy link) URL as the job link.
+    Google careers search:
+    - Find anchors whose href points to a specific job details page
+      under /about/careers/applications/jobs/results/ with no query string.
+    - Use aria-label or text as the title.
+    - Keep only Software Engineer I/II/III roles (non senior).
     """
     source = "Google"
     base = "https://www.google.com"
@@ -351,76 +353,35 @@ def scrape_google(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
     try:
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "h2, h3, h4")
+                (By.CSS_SELECTOR, 'a[href*="/about/careers/applications/jobs/results/"]')
             )
         )
     except Exception:
+        # If the wait fails we still try to parse whatever we got
         pass
 
     soup = BeautifulSoup(driver.page_source, "html.parser")
     results: list[tuple[str, str, str]] = []
     seen_urls = set()
 
-    headings = soup.find_all(["h2", "h3", "h4"])
-    for h in headings:
-        title = h.get_text(strip=True)
+    anchors = soup.select('a[href*="/about/careers/applications/jobs/results/"]')
+    for a in anchors:
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+
+        # Skip the main search URL that contains query params
+        if "?" in href:
+            continue
+
+        # Title from aria-label if present, otherwise link text
+        title = (a.get("aria-label") or a.get_text(strip=True) or "").strip()
         if not title:
             continue
+
         if "software engineer" not in title.lower():
             continue
-        if is_excluded(title):
-            continue
         if not is_google_relevant_title(title):
-            continue
-
-        # Walk up or across to find the Learn more link in the same job card
-        container = None
-
-        # Try ancestors first
-        current = h
-        for _ in range(6):
-            if current is None:
-                break
-            if current.find(
-                "a",
-                string=lambda s: s and "learn more" in s.strip().lower(),
-            ):
-                container = current
-                break
-            current = current.parent
-
-        # Fallback: nearby siblings
-        if container is None:
-            sibling = h
-            for _ in range(8):
-                sibling = sibling.next_sibling
-                if sibling is None:
-                    break
-                if getattr(sibling, "find", None):
-                    if sibling.find(
-                        "a",
-                        string=lambda s: s and "learn more" in s.strip().lower(),
-                    ):
-                        container = sibling
-                        break
-
-        if container is None:
-            continue
-
-        link = container.find(
-            "a",
-            string=lambda s: s and "learn more" in s.strip().lower(),
-        )
-        if not link:
-            link = container.find(
-                "a",
-                string=lambda s: s and "copy link" in s.strip().lower(),
-            )
-        if not link:
-            continue
-
-        href = (link.get("href") or "").strip()
-        if not href:
             continue
 
         url = absolute(base, href)
