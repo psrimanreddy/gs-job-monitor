@@ -1,8 +1,12 @@
 name: Monitor GS Jobs
 
+# This workflow runs on a schedule (every 15 minutes) and invokes the
+# monitor script to scrape career pages for new Software Engineer roles
+# across several companies.  Weekends are skipped in the script itself.
+
 on:
   schedule:
-    # Run every 15 minutes in UTC; skip weekends in script
+    # Run every 15 minutes in UTC; the script skips weekends in ET.
     - cron: '*/15 * * * *'
 
 permissions:
@@ -16,41 +20,35 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
-      # Skip weekends in Eastern Time
-      - name: Skip if weekend in ET
-        run: |
-          dow=$(TZ="America/New_York" date +%u)   # 1=Mon ... 7=Sun
-          if [ "$dow" -ge 6 ]; then
-            echo "Weekend in Eastern Time (ET); exiting."
-            exit 0
-          fi
-
-      # Check out the repository to access the script and persistence file
+      # Skip weekends in Eastern Time inside the script; no step needed here.
+      # Check out the repository to access the script and persistence file.
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Install Google Chrome and Chromedriver (via Selenium Manager)
+      # Install Chrome and Chromedriver via the browser-actions action.
       - name: Set up Chrome
         uses: browser-actions/setup-chrome@v1
 
-      # Set up Python
+      # Set up Python 3.9.
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.9'
 
-      # Install dependencies required by monitor_jobs.py
+      # Install dependencies required by monitor_jobs.py.
       - name: Install dependencies
         run: pip install selenium webdriver-manager beautifulsoup4
 
-      # Run the monitoring script once
+      # Run the monitoring script once.  Secrets for email must be set
+      # in the repository settings.
       - name: Run monitor script
         env:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         run: python monitor_jobs.py --run-once
 
-      # Commit and push updated seen_jobs.txt
+      # Commit and push updated seen_jobs.txt.  If nothing has changed,
+      # the commit command will fail and echo "No changes".
       - name: Commit updated seen jobs
         run: |
           if [ -f seen_jobs.txt ]; then
