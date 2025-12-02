@@ -1,4 +1,41 @@
 #!/usr/bin/env python3
+"""
+Monitor job postings across several company career sites and email new ones.
+
+This script scrapes career pages for Goldman Sachs, PayPal, Microsoft,
+Google, and Meta, filters roles to only the relevant Software Engineer
+positions, and sends an email when new postings are found.  It keeps
+track of previously seen postings in a simple text file (`seen_jobs.txt`).
+
+The scraping logic for each site has been tailored based on manual
+inspection via a browser:
+
+* Goldman Sachs careers site exposes job detail links under the path
+  `/roles/<id>`.  We request the first page of results sorted by
+  posting date and then extract these links.
+* PayPal’s careers site (powered by Eightfold) dynamically loads
+  postings.  We look for anchors containing either `/careers/job`,
+  `/jobs/` or the `data-ph-id` attribute.
+* Microsoft careers pages serve job details under
+  `/careers/job/<id>`.  We capture those anchors and filter titles to
+  only keep Software Engineer or Software Engineer II roles, excluding
+  Senior, Principal, Lead, Director, etc.
+* Google Careers search lists jobs with a “Learn more” button.
+  Clicking this button navigates to a job detail page whose URL
+  contains `/results/<job-id>-<slug>`.  The script uses Selenium to
+  click each “Learn more” button, record the resulting URL and title,
+  and then navigates back to the search results.
+* Meta careers search pages list software-engineer roles with
+  detail links under `/jobs/<id>`.  The scraper collects job links
+  matching this pattern and filters titles to only Software
+  Engineer roles (excluding Senior, Staff, Lead, etc.).
+
+The script uses environment variables `EMAIL_USER` and
+`EMAIL_PASSWORD` (typically GitHub Actions secrets) to send summary
+emails via Gmail.  It can be run once (`--run-once`), initialize the
+seen list (`--initialize`), or loop indefinitely (for local usage).
+"""
+
 import os
 import sys
 import time
@@ -16,23 +53,20 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-# If you prefer webdriver-manager, you can swap to the Service version instead.
-# from selenium.webdriver.chrome.service import Service
-# from webdriver_manager.chrome import ChromeDriverManager
 
 # ===============================
 # Configuration
 # ===============================
 
-GS_URL = (
-    "https://higher.gs.com/results?"
-    "EXPERIENCE_LEVEL=Analyst|Associate"
-    "&JOB_FUNCTION=Software%20Engineering"
-    "&LOCATION=San%20Francisco|Wilmington|West%20Palm%20Beach|Atlanta|Chicago|Boston|"
-    "Jersey%20City|Albany|New%20York|Dallas|Houston|Richardson|Draper|Salt%20Lake%20City"
-    "&page=1&sort=POSTED_DATE"
-)
+# A simplified URL for Goldman Sachs careers.  Filtering by experience
+# level and job function via query parameters proved unreliable; the
+# site uses client-side filters.  We request the first page sorted by
+# posted date and then filter titles in code.
+GS_URL = "https://higher.gs.com/results?page=1&sort=POSTED_DATE"
 
+# PayPal career search for Software Engineering roles in the United
+# States.  Eightfold’s dynamic loading means only the domain and
+# high-level filters appear in the URL.
 PAYPAL_URL = (
     "https://paypal.eightfold.ai/careers?"
     "domain=paypal.com&Codes=W-LINKEDIN&start=0&location=United+States"
@@ -40,27 +74,27 @@ PAYPAL_URL = (
     "&filter_job_category=Software+Engineering"
 )
 
-MS_URL = (
-    "https://apply.careers.microsoft.com/careers?"
-    "start=0"
-    "&location=United+States"
-    "&pid=1970393556621281"
-    "&sort_by=timestamp"
-    "&filter_include_remote=1"
-    "&filter_employment_type=full-time"
-    "&filter_roletype=individual+contributor"
-    "&filter_profession=software=engineering"
-)
+# Microsoft careers base URL.  The new careers site renders all jobs
+# dynamically and exposes detail links under `/careers/job/<id>`.  We
+# no longer attempt to pre-filter via query parameters (e.g., pid,
+# profession) because these change frequently and can break scraping.
+# Instead, we load the base careers page and rely on title filtering
+# in code to identify Software Engineer roles (II only).
+MS_URL = "https://apply.careers.microsoft.com/careers"
 
+# Google careers search for Software Engineer roles at early and mid
+# levels.  The script clicks “Learn more” buttons on this page to
+# capture job detail URLs.
 GOOGLE_URL = (
     "https://www.google.com/about/careers/applications/jobs/results?"
     "target_level=MID&target_level=EARLY"
     "&employment_type=FULL_TIME"
     "&sort_by=date"
-    "&location=United%20States"
+    "&location=United+States"
     "&q=%22Software%20Engineer%22"
 )
 
+# Meta careers search for Software Engineer roles in North America.
 META_URL = (
     "https://www.metacareers.com/jobsearch?"
     "q=Software%20Engineer"
@@ -68,6 +102,8 @@ META_URL = (
     "&offices[0]=North%20America"
 )
 
+# Global excluded keywords (case-insensitive) – titles containing
+# any of these substrings will be skipped.
 EXCLUDED_KEYWORDS = [
     "staff",
     "manager",
@@ -77,15 +113,19 @@ EXCLUDED_KEYWORDS = [
     "ios",
 ]
 
+# File used to persist seen job URLs.  Each line should contain one
+# job URL.  If the file does not exist, it will be created.
 SEEN_FILE = "seen_jobs.txt"
-CHECK_INTERVAL = 1800  # only used if you run locally without flags
+
+# Only used if running locally in an infinite loop (not used in CI).
+CHECK_INTERVAL = 1800  # seconds
 
 # ===============================
 # Utilities
 # ===============================
 
-
 def load_seen_jobs() -> set[str]:
+    """Return a set of previously seen job URLs."""
     if not os.path.exists(SEEN_FILE):
         return set()
     with open(SEEN_FILE, "r", encoding="utf-8") as f:
@@ -93,6 +133,7 @@ def load_seen_jobs() -> set[str]:
 
 
 def save_new_jobs(job_ids: list[str]) -> None:
+    """Append newly seen job URLs to the seen file."""
     if not job_ids:
         return
     with open(SEEN_FILE, "a", encoding="utf-8") as f:
@@ -101,14 +142,18 @@ def save_new_jobs(job_ids: list[str]) -> None:
 
 
 def is_excluded(title: str) -> bool:
+    """Return True if title contains any globally excluded keywords."""
     t = title.lower()
     return any(k in t for k in EXCLUDED_KEYWORDS)
 
 
 def is_ms_relevant_title(title: str) -> bool:
     """
-    Microsoft: only keep Software Engineer or Software Engineer II variants.
-    Drop senior/principal/manager/architect/lead/intern roles.
+    Determine if a Microsoft job title is relevant.
+
+    Only accept roles that are exactly Software Engineer or Software
+    Engineer II (including numeric variants).  Exclude Senior,
+    Principal, Manager, Lead, Architect, Intern, etc.
     """
     t = title.lower()
 
@@ -125,6 +170,7 @@ def is_ms_relevant_title(title: str) -> bool:
     if any(token in t for token in exclude_tokens):
         return False
 
+    # Only allow SE and SE II variants.  Do not accept level 3 and above.
     allowed_prefixes = [
         "software engineer ii",
         "software engineer 2",
@@ -135,8 +181,11 @@ def is_ms_relevant_title(title: str) -> bool:
 
 def is_google_relevant_title(title: str) -> bool:
     """
-    Google: keep Software Engineer, Software Engineer II, Software Engineer III.
-    Exclude senior and above.
+    Determine if a Google job title is relevant.
+
+    Accept Software Engineer (no level) and levels II and III.
+    Exclude Senior and above (including Staff, Principal, Manager,
+    Director, etc.) and Intern roles.
     """
     t = title.lower()
 
@@ -149,6 +198,7 @@ def is_google_relevant_title(title: str) -> bool:
         "lead",
         "intern",
         "internship",
+        "staff",
     ]
     if any(token in t for token in exclude_tokens):
         return False
@@ -165,10 +215,14 @@ def is_google_relevant_title(title: str) -> bool:
 
 def is_meta_relevant_title(title: str) -> bool:
     """
-    Meta: only Software Engineer roles, excluding senior/staff/manager/lead/etc.
+    Determine if a Meta job title is relevant.
+
+    Accept only non‑senior Software Engineer roles.  Exclude titles
+    containing Senior, Staff, Principal, Director, Lead, Manager,
+    Architect, or Intern.  The presence of "Software Engineer" must
+    appear somewhere in the title.
     """
     t = title.lower()
-
     if "software engineer" not in t:
         return False
 
@@ -190,19 +244,25 @@ def is_meta_relevant_title(title: str) -> bool:
 
 
 def start_browser() -> webdriver.Chrome:
-    """Start headless Chrome via Selenium Manager (no webdriver-manager needed)."""
+    """
+    Start a headless Chrome instance via Selenium Manager.
+
+    Selenium Manager automatically provisions the appropriate driver
+    binary.  Additional flags disable sandboxing and dev‑shm for
+    better compatibility in container environments.
+    """
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
-    # Selenium Manager finds a matching driver automatically:
     return webdriver.Chrome(options=opts)
-    # If you prefer webdriver-manager:
-    # service = Service(ChromeDriverManager().install())
-    # return webdriver.Chrome(service=service, options=opts)
 
 
 def absolute(base: str, href: str) -> str:
+    """
+    Compute an absolute URL given a base and a relative href.  If
+    href is already absolute, return it unchanged.
+    """
     if not href:
         return ""
     if href.startswith("http://") or href.startswith("https://"):
@@ -214,13 +274,15 @@ def absolute(base: str, href: str) -> str:
 # Site scrapers
 # ===============================
 
-
 def scrape_gs(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
+    """Scrape Goldman Sachs careers for job links and titles."""
     source = "Goldman Sachs"
     base = "https://higher.gs.com"
 
     driver.get(GS_URL)
     try:
+        # Wait until job cards are present.  Links to detail pages live
+        # under /roles/<id>, but the page is dynamically rendered.
         WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href^="/roles/"]'))
         )
@@ -229,7 +291,7 @@ def scrape_gs(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
 
     soup = BeautifulSoup(driver.page_source, "html.parser")
     results: list[tuple[str, str, str]] = []
-    seen_urls = set()
+    seen_urls: set[str] = set()
 
     for a in soup.select('a[href^="/roles/"]'):
         href = a.get("href", "").strip()
@@ -246,11 +308,14 @@ def scrape_gs(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
 
 
 def scrape_paypal(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
+    """Scrape PayPal careers for job links and titles."""
     source = "PayPal"
     base = "https://paypal.eightfold.ai"
 
     driver.get(PAYPAL_URL)
     try:
+        # Wait until at least one job link is present.  Eightfold uses
+        # dynamic rendering; anchors may have different patterns.
         WebDriverWait(driver, 20).until(
             EC.any_of(
                 EC.presence_of_element_located(
@@ -259,9 +324,7 @@ def scrape_paypal(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
                 EC.presence_of_element_located(
                     (By.CSS_SELECTOR, 'a[href*="/jobs/"]')
                 ),
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, 'a[data-ph-id]')
-                ),
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'a[data-ph-id]')),
             )
         )
     except Exception:
@@ -269,7 +332,7 @@ def scrape_paypal(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
 
     soup = BeautifulSoup(driver.page_source, "html.parser")
     results: list[tuple[str, str, str]] = []
-    seen_urls = set()
+    seen_urls: set[str] = set()
 
     anchors = soup.select(
         'a[href*="/careers/job"], a[href*="/jobs/"], a[data-ph-id]'
@@ -279,9 +342,8 @@ def scrape_paypal(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
         title = a.get_text(strip=True)
         if not href or not title:
             continue
-        looks_like_job = (
-            "/careers/job" in href or "/job/" in href or "/jobs/" in href
-        )
+        # Filter out non‑job links.  Accept if it appears to be a job.
+        looks_like_job = ("/careers/job" in href) or ("/job/" in href) or ("/jobs/" in href)
         if not looks_like_job:
             continue
         if is_excluded(title):
@@ -297,6 +359,7 @@ def scrape_paypal(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
 
 
 def scrape_ms(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
+    """Scrape Microsoft careers for relevant job links and titles."""
     source = "Microsoft"
     base = "https://apply.careers.microsoft.com"
 
@@ -308,30 +371,22 @@ def scrape_ms(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
             )
         )
     except Exception:
-        # If the wait fails we still try to parse whatever is present
         pass
 
     soup = BeautifulSoup(driver.page_source, "html.parser")
     results: list[tuple[str, str, str]] = []
-    seen_urls = set()
+    seen_urls: set[str] = set()
 
-    anchors = soup.select('a[href*="/careers/job/"]')
-    for a in anchors:
+    for a in soup.select('a[href*="/careers/job/"]'):
         href = (a.get("href") or "").strip()
         title = a.get_text(strip=True)
-
         if not href or not title:
             continue
-
-        if is_excluded(title):
+        if is_excluded(title) or not is_ms_relevant_title(title):
             continue
-        if not is_ms_relevant_title(title):
-            continue
-
         url = absolute(base, href)
         if url in seen_urls:
             continue
-
         seen_urls.add(url)
         results.append((source, url, title))
 
@@ -340,55 +395,42 @@ def scrape_ms(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
 
 def scrape_google(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
     """
-    Google careers search:
+    Scrape Google careers search results.
 
-    Strategy:
-      - Load the search URL.
-      - For each "Learn more" button/link on the first page:
-          * Grab the job title from the card.
-          * Click it with Selenium.
-          * Read the job detail URL from driver.current_url.
-          * Navigate back to the results page.
-      - Filter to Software Engineer / II / III (non-senior) using
-        is_google_relevant_title and is_excluded.
+    The Google job search interface lists positions with a “Learn more”
+    button.  This scraper clicks each button, records the resulting
+    job detail URL and title, filters titles (Software Engineer I/II/III),
+    and then navigates back to the search page.
     """
     source = "Google"
-
     driver.get(GOOGLE_URL)
     try:
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located(
-                (
-                    By.XPATH,
-                    "//button[normalize-space()='Learn more'] | "
-                    "//a[normalize-space()='Learn more']",
-                )
+                (By.XPATH, "//button[normalize-space()='Learn more'] | //a[normalize-space()='Learn more']")
             )
         )
     except Exception:
-        print("[WARN] Google: no 'Learn more' elements found after wait.")
         return []
 
     results: list[tuple[str, str, str]] = []
     seen_urls: set[str] = set()
 
-    # Reasonable upper bound for jobs on first page
+    # Google results are paginated via scroll; we process only first page
+    # (typically ~20 jobs) to minimize runtime.  Adjust as needed.
     max_jobs = 30
 
     for idx in range(max_jobs):
         try:
-            # Refresh the button list each loop since DOM changes when we navigate
             buttons = driver.find_elements(
                 By.XPATH,
-                "//button[normalize-space()='Learn more'] | "
-                "//a[normalize-space()='Learn more']",
+                "//button[normalize-space()='Learn more'] | //a[normalize-space()='Learn more']",
             )
             if idx >= len(buttons):
                 break
 
             btn = buttons[idx]
-
-            # Scroll into view so click is reliable
+            # Scroll into view to avoid click interception
             try:
                 driver.execute_script(
                     "arguments[0].scrollIntoView({block: 'center'});", btn
@@ -396,13 +438,11 @@ def scrape_google(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
             except Exception:
                 pass
 
-            # Get title from closest heading in the job card
+            # Extract title from nearest heading
             title = ""
             try:
-                container = btn.find_element(
-                    By.XPATH, "ancestor::*[.//h3 or .//h2][1]"
-                )
-                heading = container.find_element(By.XPATH, ".//h3 | .//h2")
+                container = btn.find_element(By.XPATH, "ancestor::*[.//h2 or .//h3][1]")
+                heading = container.find_element(By.XPATH, ".//h2 | .//h3")
                 title = heading.text.strip()
             except Exception:
                 title = ""
@@ -415,24 +455,17 @@ def scrape_google(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
                     continue
 
             old_url = driver.current_url
-
-            # Click the Learn more using JS
             try:
                 driver.execute_script("arguments[0].click();", btn)
-            except Exception as exc:
-                print(f"[WARN] Google: click failed for index {idx}: {exc}")
+            except Exception:
                 continue
 
-            # Wait until URL actually changes from the search URL
+            # Wait for the URL to change to a job detail page
             try:
                 WebDriverWait(driver, 20).until(EC.url_changes(old_url))
                 url = driver.current_url
-            except Exception as exc:
-                print(
-                    f"[WARN] Google: did not reach job detail page for index "
-                    f"{idx}: {exc}"
-                )
-                # Try to go back and continue
+            except Exception:
+                # Navigation failed – go back and continue
                 try:
                     driver.back()
                     WebDriverWait(driver, 20).until(
@@ -448,20 +481,16 @@ def scrape_google(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
                     pass
                 continue
 
-            # If title was empty, try to read it from detail page
             if not title:
                 try:
                     heading = WebDriverWait(driver, 10).until(
-                        EC.presence_of_element_located(
-                            (By.XPATH, "//h1 | //h2")
-                        )
+                        EC.presence_of_element_located((By.XPATH, "//h1 | //h2"))
                     )
                     title = heading.text.strip()
                 except Exception:
                     title = "Software Engineer (Google job)"
 
             if url in seen_urls:
-                # Already processed in this run
                 try:
                     driver.back()
                     WebDriverWait(driver, 20).until(
@@ -479,7 +508,6 @@ def scrape_google(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
 
             seen_urls.add(url)
 
-            # Final filter
             if (
                 "software engineer" in title.lower()
                 and is_google_relevant_title(title)
@@ -499,17 +527,10 @@ def scrape_google(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
                         )
                     )
                 )
-            except Exception as exc:
-                print(
-                    f"[WARN] Google: failed to navigate back after job at "
-                    f"index {idx}: {exc}"
-                )
+            except Exception:
                 break
 
-        except Exception as exc:
-            print(
-                f"[WARN] Google: unexpected error while processing index {idx}: {exc}"
-            )
+        except Exception:
             break
 
     return results
@@ -517,9 +538,14 @@ def scrape_google(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
 
 def scrape_meta(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
     """
-    Meta careers search:
-    - Look for anchors whose href contains /jobs/.
-    - Keep only Software Engineer titles (non senior/staff/manager).
+    Scrape Meta careers search for relevant Software Engineer roles.
+
+    Meta’s search page lists roles with anchors pointing to `/jobs/<id>`
+    rather than the `/profile/job_details/` pattern used on detail pages.
+    We parse the search results page, collect unique job links under
+    `/jobs/`, and filter titles to only include non‑senior Software
+    Engineer roles.  If Meta’s markup changes, adjust the selector
+    accordingly.
     """
     source = "Meta"
     base = "https://www.metacareers.com"
@@ -536,25 +562,22 @@ def scrape_meta(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
 
     soup = BeautifulSoup(driver.page_source, "html.parser")
     results: list[tuple[str, str, str]] = []
-    seen_urls = set()
+    seen_urls: set[str] = set()
 
+    # Job links on the search page use /jobs/<id>.  We capture these and
+    # filter the titles.  Some roles such as "Senior" or "Staff" are
+    # excluded via is_meta_relevant_title().
     anchors = soup.select('a[href*="/jobs/"]')
     for a in anchors:
         href = (a.get("href") or "").strip()
         title = a.get_text(strip=True)
-
         if not href or not title:
             continue
-
-        if is_excluded(title):
+        if is_excluded(title) or not is_meta_relevant_title(title):
             continue
-        if not is_meta_relevant_title(title):
-            continue
-
         url = absolute(base, href)
         if url in seen_urls:
             continue
-
         seen_urls.add(url)
         results.append((source, url, title))
 
@@ -565,8 +588,8 @@ def scrape_meta(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
 # Email
 # ===============================
 
-
 def format_email_html(grouped: dict[str, list[tuple[str, str]]]) -> str:
+    """Return an HTML string summarizing new jobs grouped by source."""
     parts = ['<h3>New Job Postings</h3>']
     for source, items in grouped.items():
         if not items:
@@ -582,6 +605,13 @@ def format_email_html(grouped: dict[str, list[tuple[str, str]]]) -> str:
 
 
 def send_email(new_items: list[tuple[str, str, str]]) -> None:
+    """
+    Send an email summarizing new job postings.
+
+    If no new items are provided, this function returns immediately.
+    A grouping by source is performed so that the email is organized
+    nicely.  Gmail SSL on port 465 is used to send the message.
+    """
     if not new_items:
         return
 
@@ -619,39 +649,34 @@ def send_email(new_items: list[tuple[str, str, str]]) -> None:
 # Orchestration
 # ===============================
 
-
 def fetch_all(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
+    """Fetch job postings from all configured sources."""
     items: list[tuple[str, str, str]] = []
-
     try:
         items.extend(scrape_gs(driver))
     except Exception as exc:
         print(f"[WARN] GS scrape error: {exc}")
-
     try:
         items.extend(scrape_paypal(driver))
     except Exception as exc:
         print(f"[WARN] PayPal scrape error: {exc}")
-
     try:
         items.extend(scrape_ms(driver))
     except Exception as exc:
         print(f"[WARN] Microsoft scrape error: {exc}")
-
     try:
         items.extend(scrape_google(driver))
     except Exception as exc:
         print(f"[WARN] Google scrape error: {exc}")
-
     try:
         items.extend(scrape_meta(driver))
     except Exception as exc:
         print(f"[WARN] Meta scrape error: {exc}")
-
     return items
 
 
 def run_once() -> None:
+    """Perform a single scrape and email any new job postings."""
     seen = load_seen_jobs()
     driver = start_browser()
     try:
@@ -672,11 +697,18 @@ def run_once() -> None:
 
 
 def initialize_seen() -> None:
+    """
+    Initialize the seen jobs file with the current postings.
+
+    This function discards previous `seen_jobs.txt` content and records
+    the current job URLs so they will not trigger an email until new
+    postings appear.
+    """
     driver = start_browser()
     try:
         all_items = fetch_all(driver)
         unique_urls = [url for (_, url, _) in all_items]
-        seen_set = set()
+        seen_set: set[str] = set()
         init_list: list[str] = []
         for u in unique_urls:
             if u not in seen_set:
