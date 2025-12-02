@@ -49,7 +49,7 @@ MS_URL = (
     "&filter_include_remote=1"
     "&filter_employment_type=full-time"
     "&filter_roletype=individual+contributor"
-    "&filter_profession=software+engineering"
+    "&filter_profession=software=engineering"
 )
 
 GOOGLE_URL = (
@@ -341,55 +341,176 @@ def scrape_ms(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
 def scrape_google(driver: webdriver.Chrome) -> list[tuple[str, str, str]]:
     """
     Google careers search:
-    - Find anchors whose href points to a specific job details page
-      under /about/careers/applications/jobs/results/ with no query string.
-    - Use aria-label or text as the title.
-    - Keep only Software Engineer I/II/III roles (non senior).
+
+    Strategy:
+      - Load the search URL.
+      - For each "Learn more" button/link on the first page:
+          * Grab the job title from the card.
+          * Click it with Selenium.
+          * Read the job detail URL from driver.current_url.
+          * Navigate back to the results page.
+      - Filter to Software Engineer / II / III (non-senior) using
+        is_google_relevant_title and is_excluded.
     """
     source = "Google"
-    base = "https://www.google.com"
 
     driver.get(GOOGLE_URL)
     try:
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located(
-                (By.CSS_SELECTOR, 'a[href*="/about/careers/applications/jobs/results/"]')
+                (
+                    By.XPATH,
+                    "//button[normalize-space()='Learn more'] | "
+                    "//a[normalize-space()='Learn more']",
+                )
             )
         )
     except Exception:
-        # If the wait fails we still try to parse whatever we got
-        pass
+        print("[WARN] Google: no 'Learn more' elements found after wait.")
+        return []
 
-    soup = BeautifulSoup(driver.page_source, "html.parser")
     results: list[tuple[str, str, str]] = []
-    seen_urls = set()
+    seen_urls: set[str] = set()
 
-    anchors = soup.select('a[href*="/about/careers/applications/jobs/results/"]')
-    for a in anchors:
-        href = (a.get("href") or "").strip()
-        if not href:
-            continue
+    # Reasonable upper bound for jobs on first page
+    max_jobs = 30
 
-        # Skip the main search URL that contains query params
-        if "?" in href:
-            continue
+    for idx in range(max_jobs):
+        try:
+            # Refresh the button list each loop since DOM changes when we navigate
+            buttons = driver.find_elements(
+                By.XPATH,
+                "//button[normalize-space()='Learn more'] | "
+                "//a[normalize-space()='Learn more']",
+            )
+            if idx >= len(buttons):
+                break
 
-        # Title from aria-label if present, otherwise link text
-        title = (a.get("aria-label") or a.get_text(strip=True) or "").strip()
-        if not title:
-            continue
+            btn = buttons[idx]
 
-        if "software engineer" not in title.lower():
-            continue
-        if not is_google_relevant_title(title):
-            continue
+            # Scroll into view so click is reliable
+            try:
+                driver.execute_script(
+                    "arguments[0].scrollIntoView({block: 'center'});", btn
+                )
+            except Exception:
+                pass
 
-        url = absolute(base, href)
-        if url in seen_urls:
-            continue
+            # Get title from closest heading in the job card
+            title = ""
+            try:
+                container = btn.find_element(
+                    By.XPATH, "ancestor::*[.//h3 or .//h2][1]"
+                )
+                heading = container.find_element(By.XPATH, ".//h3 | .//h2")
+                title = heading.text.strip()
+            except Exception:
+                title = ""
 
-        seen_urls.add(url)
-        results.append((source, url, title))
+            if title:
+                lower = title.lower()
+                if "software engineer" not in lower:
+                    continue
+                if is_excluded(title) or not is_google_relevant_title(title):
+                    continue
+
+            old_url = driver.current_url
+
+            # Click the Learn more using JS
+            try:
+                driver.execute_script("arguments[0].click();", btn)
+            except Exception as exc:
+                print(f"[WARN] Google: click failed for index {idx}: {exc}")
+                continue
+
+            # Wait until URL actually changes from the search URL
+            try:
+                WebDriverWait(driver, 20).until(EC.url_changes(old_url))
+                url = driver.current_url
+            except Exception as exc:
+                print(
+                    f"[WARN] Google: did not reach job detail page for index "
+                    f"{idx}: {exc}"
+                )
+                # Try to go back and continue
+                try:
+                    driver.back()
+                    WebDriverWait(driver, 20).until(
+                        EC.presence_of_element_located(
+                            (
+                                By.XPATH,
+                                "//button[normalize-space()='Learn more'] | "
+                                "//a[normalize-space()='Learn more']",
+                            )
+                        )
+                    )
+                except Exception:
+                    pass
+                continue
+
+            # If title was empty, try to read it from detail page
+            if not title:
+                try:
+                    heading = WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located(
+                            (By.XPATH, "//h1 | //h2")
+                        )
+                    )
+                    title = heading.text.strip()
+                except Exception:
+                    title = "Software Engineer (Google job)"
+
+            if url in seen_urls:
+                # Already processed in this run
+                try:
+                    driver.back()
+                    WebDriverWait(driver, 20).until(
+                        EC.presence_of_element_located(
+                            (
+                                By.XPATH,
+                                "//button[normalize-space()='Learn more'] | "
+                                "//a[normalize-space()='Learn more']",
+                            )
+                        )
+                    )
+                except Exception:
+                    pass
+                continue
+
+            seen_urls.add(url)
+
+            # Final filter
+            if (
+                "software engineer" in title.lower()
+                and is_google_relevant_title(title)
+                and not is_excluded(title)
+            ):
+                results.append((source, url, title))
+
+            # Navigate back to the results page for the next job
+            try:
+                driver.back()
+                WebDriverWait(driver, 20).until(
+                    EC.presence_of_element_located(
+                        (
+                            By.XPATH,
+                            "//button[normalize-space()='Learn more'] | "
+                            "//a[normalize-space()='Learn more']",
+                        )
+                    )
+                )
+            except Exception as exc:
+                print(
+                    f"[WARN] Google: failed to navigate back after job at "
+                    f"index {idx}: {exc}"
+                )
+                break
+
+        except Exception as exc:
+            print(
+                f"[WARN] Google: unexpected error while processing index {idx}: {exc}"
+            )
+            break
 
     return results
 
