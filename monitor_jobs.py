@@ -58,11 +58,25 @@ from selenium.webdriver.support import expected_conditions as EC
 # Configuration
 # ===============================
 
-# A simplified URL for Goldman Sachs careers.  Filtering by experience
-# level and job function via query parameters proved unreliable; the
-# site uses client-side filters.  We request the first page sorted by
-# posted date and then filter titles in code.
-GS_URL = "https://higher.gs.com/results?page=1&sort=POSTED_DATE"
+# Goldman Sachs careers search URL.
+#
+# The GS careers site allows server-side filtering via query parameters for
+# experience level, job function and location.  The original version of
+# this script used those parameters to restrict results to Analyst/Associate
+# Software Engineering roles in specific U.S. offices.  If you wish to
+# broaden or narrow the search, modify the EXPERIENCE_LEVEL, JOB_FUNCTION,
+# and LOCATION lists accordingly.  When the site changed to client-side
+# filters in early 2024 we simplified the URL, but this version restores
+# the explicit filters so that only jobs matching the specified locations
+# and function are fetched.
+GS_URL = (
+    "https://higher.gs.com/results?"
+    "EXPERIENCE_LEVEL=Analyst|Associate"
+    "&JOB_FUNCTION=Software%20Engineering"
+    "&LOCATION=San%20Francisco|Wilmington|West%20Palm%20Beach|Atlanta|Chicago|Boston|"
+    "Jersey%20City|Albany|New%20York|Dallas|Houston|Richardson|Draper|Salt%20Lake%20City"
+    "&page=1&sort=POSTED_DATE"
+)
 
 # PayPal career search for Software Engineering roles in the United
 # States.  Eightfold’s dynamic loading means only the domain and
@@ -74,13 +88,27 @@ PAYPAL_URL = (
     "&filter_job_category=Software+Engineering"
 )
 
-# Microsoft careers base URL.  The new careers site renders all jobs
-# dynamically and exposes detail links under `/careers/job/<id>`.  We
-# no longer attempt to pre-filter via query parameters (e.g., pid,
-# profession) because these change frequently and can break scraping.
-# Instead, we load the base careers page and rely on title filtering
-# in code to identify Software Engineer roles (II only).
-MS_URL = "https://apply.careers.microsoft.com/careers"
+# Microsoft careers search URL.
+#
+# The original script targeted Microsoft Software Engineering roles by
+# specifying the pid for the Software Engineering profession and
+# restricting to full-time individual-contributor positions in the
+# United States.  While the new careers site is entirely dynamic, the
+# query parameters still work for initial server-side filtering.  Reverting
+# to the parameterised URL reduces the number of irrelevant results
+# processed by the scraper.  If the site changes and this URL stops
+# working, you can revert back to the base URL.
+MS_URL = (
+    "https://apply.careers.microsoft.com/careers?"
+    "start=0"
+    "&location=United+States"
+    "&pid=1970393556621281"
+    "&sort_by=timestamp"
+    "&filter_include_remote=1"
+    "&filter_employment_type=full-time"
+    "&filter_roletype=individual+contributor"
+    "&filter_profession=software+engineering"
+)
 
 # Google careers search for Software Engineer roles at early and mid
 # levels.  The script clicks “Learn more” buttons on this page to
